@@ -1,0 +1,9 @@
+/**:
+  ros__parameters:
+    publish_tf: True
+    disable_imu: False
+    frame_gnss_main: main_gnss
+    frame_gnss_aux: aux_gnss
+    frame_imu: imu
+    covariance_threshold: 0.01
+    antenna_distance_tolerance: 0.05
