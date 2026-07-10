@@ -253,8 +253,7 @@ void GnssToOdom::fix_to_odom(const gps_msgs::msg::GPSFix::SharedPtr& fix, nav_ms
 /// This function initializes the ENU coordinate system on first call by either:
 /// - Publishing a static transform from "earth" to "map" frame if publish_tf_ is true
 /// - Looking up the existing transform from TF tree if publish_tf_ is false
-/// The origin is set using rounded coordinates (0.01 degree precision for lat/lon,
-/// millimeter precision for altitude) and adjusted altitude
+/// The origin is set using rounded coordinates (0.01 degree precision) and adjusted altitude
 /// (GNSS antenna altitude minus the central point height relative to base_footprint).
 /// Subsequent calls convert the provided WGS84 coordinates to ENU using the initialized system.
 void GnssToOdom::wgs84_to_enu(double latitude, double longitude, double altitude, geometry_msgs::msg::Point& position)
@@ -282,9 +281,9 @@ void GnssToOdom::wgs84_to_enu(double latitude, double longitude, double altitude
 
       double latitude_rounded = round(latitude * 100) / 100.;
       double longitude_rounded = round(longitude * 100) / 100.;
-      double altitude_rounded = round((altitude - position_tf_gnss_.z()) * 1000) / 1000.;
+      double altitude_map = altitude - position_tf_gnss_.z();
 
-      earth.Forward(latitude_rounded, longitude_rounded, altitude_rounded, t.transform.translation.x,
+      earth.Forward(latitude_rounded, longitude_rounded, altitude_map, t.transform.translation.x,
                     t.transform.translation.y, t.transform.translation.z);
 
       // Rotation ENU -> ECEF so that map frame axes are East-North-Up at origin
@@ -299,7 +298,7 @@ void GnssToOdom::wgs84_to_enu(double latitude, double longitude, double altitude
 
       tf_static_broadcaster_->sendTransform(t);
 
-      enu_.Reset(latitude_rounded, longitude_rounded, altitude_rounded);
+      enu_.Reset(latitude_rounded, longitude_rounded, altitude_map);
     }
     else
     {
