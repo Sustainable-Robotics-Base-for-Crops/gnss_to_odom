@@ -145,6 +145,7 @@ LNI::CallbackReturn GnssToOdom::on_activate(const rclcpp_lifecycle::State& state
   RCLCPP_INFO_STREAM(this->get_logger(), "Yaw offset: " << yaw_offset_);
 
   time_imu_ = this->now();
+  time_rtcm_ = this->now();
   time_gnss_main_ = this->now();
   time_gnss_aux_ = this->now();
 
@@ -153,6 +154,9 @@ LNI::CallbackReturn GnssToOdom::on_activate(const rclcpp_lifecycle::State& state
 
   sub_gnss_aux_ = this->create_subscription<gps_msgs::msg::GPSFix>("gnss/aux/fix_vel_att", 10,
                                                                    std::bind(&GnssToOdom::gnss_aux_callback, this, _1));
+
+  sub_rtcm_ = this->create_subscription<mavros_msgs::msg::RTCM>("gnss/rtcm", 10,
+                                                                std::bind(&GnssToOdom::rtcm_callback, this, _1));
 
   sub_imu_ =
       this->create_subscription<sensor_msgs::msg::Imu>("imu", 10, std::bind(&GnssToOdom::imu_callback, this, _1));
@@ -183,6 +187,7 @@ LNI::CallbackReturn GnssToOdom::on_cleanup(const rclcpp_lifecycle::State&)
 
   sub_gnss_main_.reset();
   sub_gnss_aux_.reset();
+  sub_rtcm_.reset();
   sub_imu_.reset();
 
   tf_buffer_.reset();
@@ -207,6 +212,7 @@ LNI::CallbackReturn GnssToOdom::on_shutdown(const rclcpp_lifecycle::State&)
 
   sub_gnss_main_.reset();
   sub_gnss_aux_.reset();
+  sub_rtcm_.reset();
   sub_imu_.reset();
 
   tf_buffer_.reset();
@@ -614,6 +620,11 @@ void GnssToOdom::gnss_aux_callback(const gps_msgs::msg::GPSFix::SharedPtr msg)
   time_gnss_aux_ = this->now();
 }
 
+void GnssToOdom::rtcm_callback(const mavros_msgs::msg::RTCM::SharedPtr msg)
+{
+  time_rtcm_ = this->now();
+}
+
 void GnssToOdom::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg)
 {
   if (disable_imu_)
@@ -666,6 +677,15 @@ void GnssToOdom::status_timer_callback()
   else
   {
     msg_status_.data &= ~(1ULL << uint8_t(LocStatus::error_no_signal_imu));
+  }
+
+  if ((this->now() - time_rtcm_).seconds() > 5)
+  {
+    msg_status_.data |= (1ULL << uint8_t(LocStatus::error_no_rtcm));
+  }
+  else
+  {
+    msg_status_.data &= ~(1ULL << uint8_t(LocStatus::error_no_rtcm));
   }
 
   pub_status_->publish(msg_status_);

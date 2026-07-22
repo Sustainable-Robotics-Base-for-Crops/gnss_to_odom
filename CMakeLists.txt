@@ -17,6 +17,7 @@ set(dependencies
   std_msgs
   nav_msgs
   gps_msgs
+  mavros_msgs
   sensor_msgs
   geometry_msgs
   tf2_ros

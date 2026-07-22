@@ -8,6 +8,7 @@
 #include "std_msgs/msg/u_int64.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "gps_msgs/msg/gps_fix.hpp"
+#include "mavros_msgs/msg/rtcm.hpp"
 #include "sensor_msgs/msg/imu.hpp"
 #include "geometry_msgs/msg/point.hpp"
 #include "geometry_msgs/msg/vector3.hpp"
@@ -35,6 +36,7 @@ enum class LocStatus : uint8_t
   error_no_rtk_fix = 35,
   error_covariance = 36,
   error_check_accuracy = 37,
+  error_no_rtcm = 38,
 };
 
 class GnssToOdom : public rclcpp_lifecycle::LifecycleNode
@@ -71,6 +73,7 @@ protected:
 
   void gnss_main_callback(const gps_msgs::msg::GPSFix::SharedPtr msg);
   void gnss_aux_callback(const gps_msgs::msg::GPSFix::SharedPtr msg);
+  void rtcm_callback(const mavros_msgs::msg::RTCM::SharedPtr msg);
   void imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg);
   void status_timer_callback();
 
@@ -90,6 +93,7 @@ private:
   bool enu_initialized_{ false };
 
   rclcpp::Time time_imu_;
+  rclcpp::Time time_rtcm_;
   rclcpp::Time time_gnss_main_;
   rclcpp::Time time_gnss_aux_;
   GeographicLib::LocalCartesian enu_;
@@ -124,6 +128,7 @@ private:
 
   rclcpp::Subscription<gps_msgs::msg::GPSFix>::SharedPtr sub_gnss_main_;
   rclcpp::Subscription<gps_msgs::msg::GPSFix>::SharedPtr sub_gnss_aux_;
+  rclcpp::Subscription<mavros_msgs::msg::RTCM>::SharedPtr sub_rtcm_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
 };
 }  // namespace gnss_to_odom

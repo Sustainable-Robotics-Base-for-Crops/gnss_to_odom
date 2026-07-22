@@ -20,7 +20,7 @@ At activate, static transforms from `base_footprint` to the GNSS and IMU frames 
 
 On first fix, the ENU origin is initialized. If `publish_tf` is true, a static `earth` → `map` transform is published. Otherwise `earth` → `map` is read from TF.
 
-A 1 Hz timer publishes `status`. IMU data older than 0.2 s is ignored (roll and pitch set to zero) unless `disable_imu` is true.
+A 1 Hz timer publishes `status`. IMU data older than 0.2 s is ignored (roll and pitch set to zero) unless `disable_imu` is true. The status bit `error_no_rtcm` is set when no RTCM message arrived for more than 5 s.
 
 ## Parameters
 
@@ -40,6 +40,7 @@ A 1 Hz timer publishes `status`. IMU data older than 0.2 s is ignored (roll and 
 | ----------------------- | ----------------------- | --------- | ----------------------------------------------- |
 | `gnss/main/fix_vel_att` | `gps_msgs/msg/GPSFix`   | In        | Main GNSS fix and velocity                      |
 | `gnss/aux/fix_vel_att`  | `gps_msgs/msg/GPSFix`   | In        | Auxiliary GNSS fix                              |
+| `gnss/rtcm`             | `mavros_msgs/msg/RTCM`  | In        | RTCM corrections (watchdog only)                |
 | `imu`                   | `sensor_msgs/msg/Imu`   | In        | IMU orientation and angular velocity            |
 | `odom`                  | `nav_msgs/msg/Odometry` | Out       | Fused odometry for `base_footprint` in `map`    |
 | `gnss/main/odom`        | `nav_msgs/msg/Odometry` | Out       | Main antenna odometry in `map`                  |
@@ -60,6 +61,7 @@ Subscribers are created in the active lifecycle state.
 | `35` | `error_no_rtk_fix`          | RTK fix not available               |
 | `36` | `error_covariance`          | Position covariance above threshold |
 | `37` | `error_check_accuracy`      | Antenna distance check failed       |
+| `38` | `error_no_rtcm`             | No RTCM for more than 5 s           |
 
 Required static transforms (URDF or `static_transform_publisher`):
 
