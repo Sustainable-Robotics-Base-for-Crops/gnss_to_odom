@@ -620,7 +620,7 @@ void GnssToOdom::gnss_aux_callback(const gps_msgs::msg::GPSFix::SharedPtr msg)
   time_gnss_aux_ = this->now();
 }
 
-void GnssToOdom::rtcm_callback(const mavros_msgs::msg::RTCM::SharedPtr msg)
+void GnssToOdom::rtcm_callback(const mavros_msgs::msg::RTCM::SharedPtr)
 {
   time_rtcm_ = this->now();
 }
