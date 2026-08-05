@@ -1,5 +1,7 @@
 // Copyright 2026 SABI AGRI
 
+#include <cmath>
+
 #include "gnss_to_odom/gnss_to_odom.hpp"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include "tf2/LinearMath/Matrix3x3.hpp"
@@ -20,6 +22,10 @@ GnssToOdom::GnssToOdom(const rclcpp::NodeOptions& options) : rclcpp_lifecycle::L
   this->declare_parameter("frame_imu", frame_imu_);
   this->declare_parameter("covariance_threshold", covariance_threshold_);
   this->declare_parameter("antenna_distance_tolerance", antenna_distance_tolerance_);
+  this->declare_parameter("heading_mode", heading_mode_);
+  this->declare_parameter("heading_std_max_deg", heading_std_max_deg_);
+  this->declare_parameter("heading_hold_timeout_s", heading_hold_timeout_s_);
+  this->declare_parameter("allow_main_only_position", allow_main_only_position_);
 }
 
 LNI::CallbackReturn GnssToOdom::on_configure(const rclcpp_lifecycle::State&)
@@ -31,6 +37,17 @@ LNI::CallbackReturn GnssToOdom::on_configure(const rclcpp_lifecycle::State&)
   this->get_parameter("frame_imu", frame_imu_);
   this->get_parameter("covariance_threshold", covariance_threshold_);
   this->get_parameter("antenna_distance_tolerance", antenna_distance_tolerance_);
+  this->get_parameter("heading_mode", heading_mode_);
+  this->get_parameter("heading_std_max_deg", heading_std_max_deg_);
+  this->get_parameter("heading_hold_timeout_s", heading_hold_timeout_s_);
+  this->get_parameter("allow_main_only_position", allow_main_only_position_);
+
+  if (heading_mode_ != "uniheading" && heading_mode_ != "baseline" && heading_mode_ != "auto")
+  {
+    RCLCPP_WARN_STREAM(this->get_logger(),
+                       "Unknown heading_mode '" << heading_mode_ << "', falling back to 'uniheading'");
+    heading_mode_ = "uniheading";
+  }
 
   tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -143,12 +160,26 @@ LNI::CallbackReturn GnssToOdom::on_activate(const rclcpp_lifecycle::State& state
                       tf_gnss_aux.transform.translation.x - tf_gnss_main.transform.translation.x);
 
   RCLCPP_INFO_STREAM(this->get_logger(), "Yaw offset: " << yaw_offset_);
+  RCLCPP_INFO_STREAM(this->get_logger(),
+                     "Heading mode: " << heading_mode_ << " (std_max=" << heading_std_max_deg_
+                                      << " deg, hold=" << heading_hold_timeout_s_
+                                      << " s, main_only_position=" << (allow_main_only_position_ ? "true" : "false")
+                                      << ")");
 
   time_imu_ = this->now();
   time_rtcm_ = this->now();
   time_gnss_main_ = this->now();
   time_gnss_aux_ = this->now();
+  time_heading_sample_ = this->now();
+  time_yaw_held_ = this->now();
 
+  heading_sample_valid_ = false;
+  yaw_held_valid_ = false;
+  last_heading_source_ = HeadingSource::none;
+  using_main_only_position_ = false;
+  gnss_main_status_ = gps_msgs::msg::GPSStatus::STATUS_NO_FIX;
+  gnss_aux_status_ = gps_msgs::msg::GPSStatus::STATUS_NO_FIX;
+  heading_err_deg_ = 1e9;
   sub_gnss_main_ = this->create_subscription<gps_msgs::msg::GPSFix>(
       "gnss/main/fix_vel_att", 10, std::bind(&GnssToOdom::gnss_main_callback, this, _1));
 
@@ -336,23 +367,72 @@ void GnssToOdom::wgs84_to_enu(double latitude, double longitude, double altitude
   enu_.Forward(latitude, longitude, altitude, position.x, position.y, position.z);
 }
 
-/// \brief Updates the odometry message by fusing data from dual GNSS antennas and IMU
+/// \brief Unicore UNIHEADING is degrees clockwise from True North to the master→slave
+/// baseline. ENU yaw is counterclockwise from East, so baseline_enu = 90° - track.
+double GnssToOdom::uniheading_to_yaw(double track_deg) const
+{
+  const double baseline_yaw_enu = angles::from_degrees(90.0 - track_deg);
+  return angles::normalize_angle(baseline_yaw_enu - yaw_offset_);
+}
+
+bool GnssToOdom::resolve_yaw(double& yaw, HeadingSource& source)
+{
+  const bool prefer_uniheading = (heading_mode_ == "uniheading" || heading_mode_ == "auto");
+  const bool prefer_baseline = (heading_mode_ == "baseline" || heading_mode_ == "auto");
+  const bool aux_fixed = gnss_aux_status_ >= gps_msgs::msg::GPSStatus::STATUS_GBAS_FIX;
+  const bool uniheading_healthy = heading_sample_valid_ && std::isfinite(heading_track_deg_) &&
+                                  std::isfinite(heading_err_deg_) && heading_err_deg_ >= 0.0 &&
+                                  heading_err_deg_ <= heading_std_max_deg_ &&
+                                  (this->now() - time_heading_sample_).seconds() < 0.5;
+
+  if (prefer_uniheading && uniheading_healthy)
+  {
+    yaw = uniheading_to_yaw(heading_track_deg_);
+    source = HeadingSource::uniheading;
+    yaw_held_ = yaw;
+    time_yaw_held_ = this->now();
+    yaw_held_valid_ = true;
+    return true;
+  }
+
+  if (prefer_baseline && aux_fixed)
+  {
+    yaw = atan2(msg_odom_aux_.pose.pose.position.y - msg_odom_main_.pose.pose.position.y,
+                msg_odom_aux_.pose.pose.position.x - msg_odom_main_.pose.pose.position.x);
+    yaw = angles::normalize_angle(yaw - yaw_offset_);
+    source = HeadingSource::baseline;
+    yaw_held_ = yaw;
+    time_yaw_held_ = this->now();
+    yaw_held_valid_ = true;
+    return true;
+  }
+
+  // Short AUX / UNIHEADING outages: keep publishing by integrating IMU yaw rate.
+  if (prefer_uniheading && yaw_held_valid_ && !disable_imu_ &&
+      (this->now() - time_yaw_held_).seconds() <= heading_hold_timeout_s_)
+  {
+    const double dt = (this->now() - time_yaw_held_).seconds();
+    yaw = angles::normalize_angle(yaw_held_ + angular_velocity_imu_.z * dt);
+    source = HeadingSource::hold;
+    yaw_held_ = yaw;
+    time_yaw_held_ = this->now();
+    return true;
+  }
+
+  source = HeadingSource::none;
+  return false;
+}
+
+/// \brief Updates the odometry message by fusing GNSS and IMU.
 ///
-/// This function computes the vehicle's pose and velocity by combining:
-/// - Dual GNSS antenna positions to determine yaw angle and average position
-/// - IMU data for roll and pitch angles
-/// - Transformations to compute base_footprint position from GNSS antenna positions
+/// Yaw preference (heading_mode=uniheading, default):
+/// 1. Receiver UNIHEADING carried by GPSFix.track when err_track is healthy
+/// 2. Gyro hold of the last good yaw for heading_hold_timeout_s
+/// 3. Geometric baseline atan2(aux-main) as last resort in "auto" / "baseline"
 ///
-/// The process includes:
-/// 1. Yaw calculation from the relative position of the two GNSS antennas
-/// 2. Orientation fusion: yaw from GNSS combined with roll/pitch from IMU
-/// 3. Position computation: average of both GNSS antenna positions, then transformed
-///    to base_footprint frame accounting for the GNSS antenna offset
-/// 4. Covariance propagation: maximum covariance values from both antennas
-/// 5. Velocity estimation: linear speed from GNSS data with sign determined by motion direction
-///
-/// If IMU data is stale (>0.2s), roll and pitch are set to zero and angular velocity is cleared.
-void GnssToOdom::update_odometry()
+/// Position: average of both antennas when aux is RTK-fixed; otherwise main only
+/// (lever arm = main antenna), so a degraded aux solution cannot pull the pose.
+bool GnssToOdom::update_odometry()
 {
   msg_odom_.header.stamp = this->now();
 
@@ -369,27 +449,74 @@ void GnssToOdom::update_odometry()
     angular_velocity_imu_.z = 0;
   }
 
-  // Orientation
-  double yaw = atan2(msg_odom_aux_.pose.pose.position.y - msg_odom_main_.pose.pose.position.y,
-                     msg_odom_aux_.pose.pose.position.x - msg_odom_main_.pose.pose.position.x);
+  double yaw = 0.0;
+  HeadingSource heading_source = HeadingSource::none;
 
-  yaw = angles::normalize_angle(yaw - yaw_offset_);
+  if (!resolve_yaw(yaw, heading_source))
+  {
+    last_heading_source_ = HeadingSource::none;
+    RCLCPP_WARN_STREAM_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                                "Cannot update odometry : no usable heading (mode="
+                                    << heading_mode_ << ", err_track=" << heading_err_deg_
+                                    << " deg, aux_status=" << gnss_aux_status_ << ")");
+    return false;
+  }
+
+  last_heading_source_ = heading_source;
 
   tf2::Quaternion q;
   q.setRPY(orientation_imu_.x, orientation_imu_.y, yaw);
   msg_odom_.pose.pose.orientation = tf2::toMsg(q);
 
-  // Position
+  const bool aux_fixed = gnss_aux_status_ >= gps_msgs::msg::GPSStatus::STATUS_GBAS_FIX;
+  const bool aux_fresh = (this->now() - time_gnss_aux_).seconds() <= 0.2;
+  using_main_only_position_ = !(aux_fixed && aux_fresh);
+
+  if (using_main_only_position_ && !allow_main_only_position_)
+  {
+    RCLCPP_WARN_STREAM_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                                "Auxiliary antenna not fixed; main-only position disabled by parameter");
+    return false;
+  }
+
   geometry_msgs::msg::Pose pose;
-  pose.position.x = (msg_odom_main_.pose.pose.position.x + msg_odom_aux_.pose.pose.position.x) / 2.;
-  pose.position.y = (msg_odom_main_.pose.pose.position.y + msg_odom_aux_.pose.pose.position.y) / 2.;
-  pose.position.z = (msg_odom_main_.pose.pose.position.z + msg_odom_aux_.pose.pose.position.z) / 2.;
+  tf2::Vector3 lever_arm;
+
+  if (using_main_only_position_)
+  {
+    pose.position = msg_odom_main_.pose.pose.position;
+    lever_arm = position_tf_gnss_main_;
+    msg_odom_.pose.covariance[0] = msg_odom_main_.pose.covariance[0];
+    msg_odom_.pose.covariance[7] = msg_odom_main_.pose.covariance[7];
+    msg_odom_.pose.covariance[14] = msg_odom_main_.pose.covariance[14];
+  }
+  else
+  {
+    pose.position.x = (msg_odom_main_.pose.pose.position.x + msg_odom_aux_.pose.pose.position.x) / 2.;
+    pose.position.y = (msg_odom_main_.pose.pose.position.y + msg_odom_aux_.pose.pose.position.y) / 2.;
+    pose.position.z = (msg_odom_main_.pose.pose.position.z + msg_odom_aux_.pose.pose.position.z) / 2.;
+    lever_arm = position_tf_gnss_;
+    msg_odom_.pose.covariance[0] = std::max(msg_odom_main_.pose.covariance[0], msg_odom_aux_.pose.covariance[0]);
+    msg_odom_.pose.covariance[7] = std::max(msg_odom_main_.pose.covariance[7], msg_odom_aux_.pose.covariance[7]);
+    msg_odom_.pose.covariance[14] = std::max(msg_odom_main_.pose.covariance[14], msg_odom_aux_.pose.covariance[14]);
+  }
+
+  // Inflate yaw covariance while holding so downstream controllers can see the degradation.
+  if (heading_source == HeadingSource::hold)
+  {
+    msg_odom_.pose.covariance[35] = std::max(msg_odom_.pose.covariance[35], 0.05);
+  }
+  else if (heading_source == HeadingSource::uniheading)
+  {
+    const double yaw_std_rad = angles::from_degrees(heading_err_deg_);
+    msg_odom_.pose.covariance[35] = yaw_std_rad * yaw_std_rad;
+  }
 
   tf2::Quaternion odom_orientation;
   tf2::fromMsg(msg_odom_.pose.pose.orientation, odom_orientation);
 
   tf2::Transform gnss_base_tf;
-  gnss_base_tf.setOrigin(tf2::quatRotate(odom_orientation, position_tf_gnss_));
+  gnss_base_tf.setOrigin(tf2::quatRotate(odom_orientation, lever_arm));
   gnss_base_tf.setRotation(tf2::Quaternion::getIdentity());
 
   tf2::Transform gnss_map_tf;
@@ -399,10 +526,6 @@ void GnssToOdom::update_odometry()
 
   geometry_msgs::msg::Point position_last = msg_odom_.pose.pose.position;
   tf2::toMsg(base_map_tf.getOrigin(), msg_odom_.pose.pose.position);
-
-  msg_odom_.pose.covariance[0] = std::max(msg_odom_main_.pose.covariance[0], msg_odom_aux_.pose.covariance[0]);
-  msg_odom_.pose.covariance[7] = std::max(msg_odom_main_.pose.covariance[7], msg_odom_aux_.pose.covariance[7]);
-  msg_odom_.pose.covariance[14] = std::max(msg_odom_main_.pose.covariance[14], msg_odom_aux_.pose.covariance[14]);
 
   // Speed
   double dx = msg_odom_.pose.pose.position.x - position_last.x;
@@ -418,9 +541,18 @@ void GnssToOdom::update_odometry()
     odom_speed_sign_ = -1;
   }
 
-  msg_odom_.twist.twist.linear.x =
-      odom_speed_sign_ * (msg_odom_main_.twist.twist.linear.x + msg_odom_aux_.twist.twist.linear.x) / 2.;
+  if (using_main_only_position_)
+  {
+    msg_odom_.twist.twist.linear.x = odom_speed_sign_ * msg_odom_main_.twist.twist.linear.x;
+  }
+  else
+  {
+    msg_odom_.twist.twist.linear.x =
+        odom_speed_sign_ * (msg_odom_main_.twist.twist.linear.x + msg_odom_aux_.twist.twist.linear.x) / 2.;
+  }
+
   msg_odom_.twist.twist.angular.z = angular_velocity_imu_.z;
+  return true;
 }
 
 /// \brief Validates the accuracy of GNSS measurements by comparing antenna distances
@@ -477,29 +609,57 @@ void GnssToOdom::publish()
                                     << ")");
 
     msg_status_.data |= (1ULL << uint8_t(LocStatus::error_no_rtk_fix));
-
     return;
   }
 
-  msg_status_.data &= ~(1ULL << uint8_t(LocStatus::error_no_rtk_fix));
+  // Heading may come from UNIHEADING / hold: auxiliary RTK fix is no longer mandatory.
+  if (last_heading_source_ == HeadingSource::none)
+  {
+    msg_status_.data |= (1ULL << uint8_t(LocStatus::error_no_heading));
+    return;
+  }
 
-  if (gnss_aux_status_ < gps_msgs::msg::GPSStatus::STATUS_GBAS_FIX)
+  msg_status_.data &= ~(1ULL << uint8_t(LocStatus::error_no_heading));
+
+  if (last_heading_source_ == HeadingSource::baseline &&
+      gnss_aux_status_ < gps_msgs::msg::GPSStatus::STATUS_GBAS_FIX)
   {
     RCLCPP_WARN_STREAM_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                                 "Cannot publish odom msg : GNSS aux status "
                                     << gnss_aux_status_ << " (must be >= " << gps_msgs::msg::GPSStatus::STATUS_GBAS_FIX
-                                    << ")");
+                                    << " in baseline heading mode)");
 
     msg_status_.data |= (1ULL << uint8_t(LocStatus::error_no_rtk_fix));
-
     return;
   }
 
-  msg_status_.data &= ~(1ULL << uint8_t(LocStatus::error_no_rtk_fix));
+  if (gnss_main_status_ >= gps_msgs::msg::GPSStatus::STATUS_GBAS_FIX &&
+      (last_heading_source_ != HeadingSource::baseline ||
+       gnss_aux_status_ >= gps_msgs::msg::GPSStatus::STATUS_GBAS_FIX))
+  {
+    msg_status_.data &= ~(1ULL << uint8_t(LocStatus::error_no_rtk_fix));
+  }
+
+  if (last_heading_source_ == HeadingSource::hold)
+  {
+    msg_status_.data |= (1ULL << uint8_t(LocStatus::warn_heading_hold));
+  }
+  else
+  {
+    msg_status_.data &= ~(1ULL << uint8_t(LocStatus::warn_heading_hold));
+  }
+
+  if (using_main_only_position_)
+  {
+    msg_status_.data |= (1ULL << uint8_t(LocStatus::warn_position_main_only));
+  }
+  else
+  {
+    msg_status_.data &= ~(1ULL << uint8_t(LocStatus::warn_position_main_only));
+  }
 
   // covariance[0] = variance in x, covariance[7] = variance in y
   double cov_main_horz = std::max(msg_odom_main_.pose.covariance[0], msg_odom_main_.pose.covariance[7]);
-  double cov_aux_horz = std::max(msg_odom_aux_.pose.covariance[0], msg_odom_aux_.pose.covariance[7]);
 
   if (cov_main_horz > covariance_threshold_)
   {
@@ -508,26 +668,28 @@ void GnssToOdom::publish()
                                     << cov_main_horz << " > " << covariance_threshold_ << ")");
 
     msg_status_.data |= (1ULL << uint8_t(LocStatus::error_covariance));
-
     return;
   }
 
-  msg_status_.data &= ~(1ULL << uint8_t(LocStatus::error_covariance));
-
-  if (cov_aux_horz > covariance_threshold_)
+  if (!using_main_only_position_)
   {
-    RCLCPP_WARN_STREAM_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                                "Cannot publish odom msg : GNSS aux covariance too high ("
-                                    << cov_aux_horz << " > " << covariance_threshold_ << ")");
+    double cov_aux_horz = std::max(msg_odom_aux_.pose.covariance[0], msg_odom_aux_.pose.covariance[7]);
 
-    msg_status_.data |= (1ULL << uint8_t(LocStatus::error_covariance));
+    if (cov_aux_horz > covariance_threshold_)
+    {
+      RCLCPP_WARN_STREAM_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                  "Cannot publish odom msg : GNSS aux covariance too high ("
+                                      << cov_aux_horz << " > " << covariance_threshold_ << ")");
 
-    return;
+      msg_status_.data |= (1ULL << uint8_t(LocStatus::error_covariance));
+      return;
+    }
   }
 
   msg_status_.data &= ~(1ULL << uint8_t(LocStatus::error_covariance));
 
-  if (!check_accuracy())
+  // Antenna-distance sanity check only makes sense with a fresh dual-antenna position.
+  if (!using_main_only_position_ && !check_accuracy())
   {
     msg_status_.data |= (1ULL << uint8_t(LocStatus::error_check_accuracy));
     return;
@@ -592,19 +754,40 @@ void GnssToOdom::gnss_main_callback(const gps_msgs::msg::GPSFix::SharedPtr msg)
 
   time_gnss_main_ = this->now();
 
-  if ((this->now() - time_gnss_aux_).seconds() > 0.2)
+  // UNIHEADING is copied onto both GPSFix topics by um982_gnss; the main message is
+  // enough to drive heading without waiting for a healthy auxiliary position.
+  if (std::isfinite(msg->track) && std::isfinite(msg->err_track))
   {
-    RCLCPP_WARN_STREAM_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                                "No GNSS aux data for : " << (this->now() - time_gnss_aux_).seconds() << "s");
+    heading_track_deg_ = msg->track;
+    heading_err_deg_ = msg->err_track;
+    heading_sample_valid_ = true;
+    time_heading_sample_ = this->now();
+  }
+
+  if (!update_odometry())
+  {
+    msg_status_.data |= (1ULL << uint8_t(LocStatus::error_no_heading));
     return;
   }
 
-  update_odometry();
   publish();
 }
 
 void GnssToOdom::gnss_aux_callback(const gps_msgs::msg::GPSFix::SharedPtr msg)
 {
+  // Always record the latest status so publish() / resolve_yaw() see aux degradation,
+  // even when the message itself cannot update the auxiliary position.
+  gnss_aux_status_ = msg->status.status;
+  time_gnss_aux_ = this->now();
+
+  if (std::isfinite(msg->track) && std::isfinite(msg->err_track))
+  {
+    heading_track_deg_ = msg->track;
+    heading_err_deg_ = msg->err_track;
+    heading_sample_valid_ = true;
+    time_heading_sample_ = this->now();
+  }
+
   if (msg->status.status == gps_msgs::msg::GPSStatus::STATUS_NO_FIX)
   {
     RCLCPP_WARN_STREAM_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -612,12 +795,8 @@ void GnssToOdom::gnss_aux_callback(const gps_msgs::msg::GPSFix::SharedPtr msg)
     return;
   }
 
-  gnss_aux_status_ = msg->status.status;
-
   fix_to_odom(msg, msg_odom_aux_);
   pub_odom_aux_->publish(msg_odom_aux_);
-
-  time_gnss_aux_ = this->now();
 }
 
 void GnssToOdom::rtcm_callback(const mavros_msgs::msg::RTCM::SharedPtr)

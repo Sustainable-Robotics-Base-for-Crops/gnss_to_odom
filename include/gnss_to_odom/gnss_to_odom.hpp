@@ -3,6 +3,8 @@
 #ifndef GNSS_TO_ODOM__GNSS_TO_ODOM_HPP_
 #define GNSS_TO_ODOM__GNSS_TO_ODOM_HPP_
 
+#include <string>
+
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
 #include "std_msgs/msg/u_int64.hpp"
@@ -29,6 +31,8 @@ enum class LocStatus : uint8_t
   // Info status [0-15] bits
   info_normal_operation = 0,
   // Warn status [16-31] bits
+  warn_heading_hold = 16,
+  warn_position_main_only = 17,
   // Error status [32-63] bits
   error_no_signal_gnss_aux = 32,
   error_no_signal_gnss_main = 33,
@@ -37,6 +41,16 @@ enum class LocStatus : uint8_t
   error_covariance = 36,
   error_check_accuracy = 37,
   error_no_rtcm = 38,
+  error_no_heading = 39,
+};
+
+/// \brief How the fused yaw was obtained on the last successful update.
+enum class HeadingSource : uint8_t
+{
+  none = 0,
+  uniheading = 1,  // receiver baseline solution (UNIHEADING via GPSFix.track)
+  hold = 2,        // last good yaw propagated with IMU yaw rate
+  baseline = 3,    // geometric atan2(aux - main), legacy path
 };
 
 class GnssToOdom : public rclcpp_lifecycle::LifecycleNode
@@ -67,9 +81,17 @@ public:
 protected:
   void fix_to_odom(const gps_msgs::msg::GPSFix::SharedPtr& fix, nav_msgs::msg::Odometry& odom);
   void wgs84_to_enu(double latitude, double longitude, double altitude, geometry_msgs::msg::Point& position);
-  void update_odometry();
+  bool update_odometry();
   bool check_accuracy();
   void publish();
+
+  /// \brief Convert Unicore UNIHEADING (deg CW from True North) to ENU yaw of the
+  /// antenna baseline, then to base_footprint yaw using yaw_offset_.
+  double uniheading_to_yaw(double track_deg) const;
+
+  /// \brief Prefer UNIHEADING when err_track is healthy; else hold with gyro; else
+  /// geometric baseline if both antennas are fixed.
+  bool resolve_yaw(double& yaw, HeadingSource& source);
 
   void gnss_main_callback(const gps_msgs::msg::GPSFix::SharedPtr msg);
   void gnss_aux_callback(const gps_msgs::msg::GPSFix::SharedPtr msg);
@@ -86,11 +108,33 @@ private:
   double covariance_threshold_{ 0.01 };
   double antenna_distance_tolerance_{ 0.05 };
 
+  // heading_mode: "uniheading" (default) | "baseline" | "auto"
+  // uniheading = UNIHEADING + gyro hold, main-only position when aux is degraded
+  // baseline   = legacy geometric dual-antenna yaw (requires aux RTK fix)
+  // auto       = uniheading when healthy, else baseline, else hold
+  std::string heading_mode_{ "uniheading" };
+  double heading_std_max_deg_{ 2.0 };
+  double heading_hold_timeout_s_{ 3.0 };
+  bool allow_main_only_position_{ true };
+
   double yaw_offset_;
-  int16_t gnss_main_status_;
-  int16_t gnss_aux_status_;
+  int16_t gnss_main_status_{ gps_msgs::msg::GPSStatus::STATUS_NO_FIX };
+  int16_t gnss_aux_status_{ gps_msgs::msg::GPSStatus::STATUS_NO_FIX };
   int8_t odom_speed_sign_{ 1 };
   bool enu_initialized_{ false };
+
+  // Latest UNIHEADING sample carried by GPSFix.track / err_track (same on main and aux).
+  double heading_track_deg_{ 0.0 };
+  double heading_err_deg_{ 1e9 };
+  bool heading_sample_valid_{ false };
+  rclcpp::Time time_heading_sample_;
+
+  // Last accepted vehicle yaw, used by the gyro hold.
+  double yaw_held_{ 0.0 };
+  rclcpp::Time time_yaw_held_;
+  bool yaw_held_valid_{ false };
+  HeadingSource last_heading_source_{ HeadingSource::none };
+  bool using_main_only_position_{ false };
 
   rclcpp::Time time_imu_;
   rclcpp::Time time_rtcm_;

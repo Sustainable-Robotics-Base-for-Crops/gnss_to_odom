@@ -7,3 +7,10 @@
     frame_imu: imu
     covariance_threshold: 0.01
     antenna_distance_tolerance: 0.05
+    # uniheading (default): use receiver UNIHEADING + gyro hold; main-only position when aux drops
+    # baseline: legacy atan2(aux-main), requires aux RTK fix
+    # auto: uniheading when healthy, else baseline, else hold
+    heading_mode: uniheading
+    heading_std_max_deg: 2.0
+    heading_hold_timeout_s: 3.0
+    allow_main_only_position: True
