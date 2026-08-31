@@ -17,4 +17,3 @@ jobs:
         with:
           package-name: gnss_to_odom
           target-ros2-distro: jazzy
-          import-token: ${{ secrets.GITHUB_TOKEN }}
