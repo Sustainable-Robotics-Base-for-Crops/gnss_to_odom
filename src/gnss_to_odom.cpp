@@ -413,7 +413,7 @@ void GnssToOdom::update_odometry()
   {
     odom_speed_sign_ = 1;
   }
-  else if (s < 1e-4)
+  else if (s < -1e-4)
   {
     odom_speed_sign_ = -1;
   }
